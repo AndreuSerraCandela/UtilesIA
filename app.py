@@ -25,7 +25,60 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Cambiad si comprobáis que el servidor cargó el código actual (útil si POST /process-json da 404).
-APP_BUILD = "2026-05-01-plain-default-table-optin"
+APP_BUILD = "2026-05-05-layout-dedupe-plain"
+
+# Ruta del fichero utilesia.env aplicado al arrancar (solo lectura para /settings).
+_UTILESIA_ENV_SOURCE: str | None = None
+
+
+def _apply_utilesia_env_file(path: Path) -> None:
+    """Carga KEY=VALUE en el proceso. No sobrescribe variables ya definidas en el entorno."""
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError as e:
+        logger.warning("No se pudo leer %s: %s", path, e)
+        return
+    for line in raw.splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        if s.startswith("export "):
+            s = s[7:].strip()
+        if "=" not in s:
+            continue
+        key, val = s.split("=", 1)
+        key = key.strip()
+        if not key:
+            continue
+        val = val.strip()
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
+            val = val[1:-1]
+        os.environ.setdefault(key, val)
+
+
+def load_utilesia_env_from_disk() -> None:
+    """
+    Opcional: fichero utilesia.env junto a app.py (copiar desde utilesia.env.example).
+    Las variables de entorno del sistema/servicio tienen prioridad (setdefault).
+    """
+    global _UTILESIA_ENV_SOURCE
+    candidate = Path(__file__).resolve().parent / "utilesia.env"
+    if not candidate.is_file():
+        return
+    _apply_utilesia_env_file(candidate)
+    _UTILESIA_ENV_SOURCE = str(candidate)
+    logger.info("UtilesIA: variables opcionales cargadas desde %s", candidate.name)
+
+
+def env_flag_enabled(name: str, *, default: bool = False) -> bool:
+    """True si la variable es 1/true/yes/on (insensible a mayúsculas)."""
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
+load_utilesia_env_from_disk()
 
 app = FastAPI(title="UtilesIA", description="Extracción PDF a texto y envío a LLM")
 
@@ -48,38 +101,65 @@ async def log_registered_routes():
 
 TOKEN_OVERHEAD = 2800
 
-_SYSTEM_RULES_COST_QTY = """Campos precio/descuento (deben cuadrar con el presupuesto: cantidad × precio neto ≈ importe línea):
-- **PROHIBIDO** usar la columna **Artículo**, **Nº**, **Ref.**, **Código** o referencia numérica del producto (ej. 138443, 103224) como **directUnitCost**. Esos son códigos, no euros. Pon ese código en **vendorItemNo** si lo ves.
-- **directUnitCost** debe salir SOLO de columnas de **importe**: preferible **Neto** (precio unitario neto). Jamás tomes el número más a la izquierda de la fila pensando que es precio.
-- **Opción preferida:** **directUnitCost** = valor de la columna **Neto** (unitario tras dto). **lineDiscountPct** = 0.
-- **Opción válida:** **directUnitCost** = columna **Precio** (bruto) y **lineDiscountPct** = dto numérico (ej. 40 para "40,00" si es porcentaje). Si eliges esta opción, NO copies el Neto en directUnitCost sin aplicar la lógica del dto.
-- Ejemplo correcto: Artículo 138443, Precio 265, Desc 40, **Neto 159** → directUnitCost **159.0**, lineDiscountPct **0**, vendorItemNo **138443** (si procede). INCORRECTO: directUnitCost 138443 o 265 sin dto cuando hay Neto 159.
-- Si en **Dto** solo pone texto tipo "Oferta" sin porcentaje, **directUnitCost** = **Neto**, **lineDiscountPct** = 0.
-- NO pongas el porcentaje de dto en directUnitCost. NO uses **Importe** total de línea (cantidad × neto) como precio unitario.
-- Orden habitual de columnas: **Artículo | Descripción | Cantidad | UM | Precio | Desc | Neto** — respétalo al leer números.
-- Si el PDF tiene **Código** y **Precio Unit.** (sin columna Neto): **vendorItemNo** = código; **directUnitCost** = Precio Unit. (número unitario, no el Importe total de línea). Comprueba que cantidad × directUnitCost ≈ Importe (tolerancia redondeo).
-- Si falta dato: directUnitCost 0, lineDiscountPct 0.
-Incluye siempre **lineDiscountPct** en cada objeto (0 si usas precio neto en directUnitCost).
-OBLIGATORIO en numeros JSON: solo PUNTO como separador decimal (ej. 10.7762, 3.06). PROHIBIDO la coma en numeros.
-Cantidad con punto si es decimal (ej. 2.0)."""
 
-_SYSTEM_RULES_TABLE_ROWS = """Solo si el usuario incluyó seccion "### TABLAS" con filas separadas por " | ":
-- Usa esas filas como fuente principal; cada fila → un objeto JSON (salvo cabeceras o totales).
-- Incluye todas las lineas de detalle (codigo vacio incluido). Coherencia por fila: no mezcles precios entre lineas.
-- Codigo → vendorItemNo; Precio Unit. → directUnitCost (nunca al revés)."""
+def resolve_llm_max_completion_tokens() -> int:
+    """
+    Tope de tokens de salida en chat completions. Sin esto, LM Studio / algunos backends
+    permiten generaciones muy largas y modelos pequeños pueden divagar miles de tokens.
+
+    UTILESIA_LLM_MAX_TOKENS — por defecto 4096 (suficiente para muchas líneas en JSON).
+    """
+    raw = os.environ.get("UTILESIA_LLM_MAX_TOKENS", "4096").strip()
+    try:
+        n = int(raw)
+    except ValueError:
+        n = 4096
+    return max(512, min(n, 120000))
+
+_SYSTEM_RULES_EXTENDED_COLUMNS = """La salida es **solo** el array JSON: sin explicacion, sin repetir el enunciado, sin markdown; debe terminar en **]** y detenerse.
+
+Columnas numéricas del PDF (rellena cada una con el valor **literal** de la tabla; **0** si esa columna no existe en el documento para esa línea):
+- **listUnitPrice**: precio unitario **bruto** / lista / antes del dto (columnas tipo Precio, P.Unit., Precio Unit.).
+- **netUnitPrice**: precio unitario **neto** tras dto (Neto, P. Neto).
+- **lineAmount**: **importe total de línea** (Importe, Total línea). Es cantidad × neto habitualmente; NO lo uses como precio unitario.
+- **documentDiscountPct**: porcentaje de descuento **tal como en el PDF** (Dto, Desc, %); ej. 52 para "52,00". **0** si no hay número o solo texto ("Oferta").
+
+**vendorItemNo**: código/ref. artículo del PDF. **PROHIBIDO** usar código numérico de artículo como precio en listUnitPrice, netUnitPrice o directUnitCost.
+
+**Compatibilidad pedidos (directUnitCost + lineDiscountPct)** — deben ser coherentes entre sí (el cliente puede ignorar columnas extendidas y usar solo estos dos):
+- Si **netUnitPrice** > 0: **directUnitCost** = netUnitPrice y **lineDiscountPct** = **0** (el dto del PDF queda reflejado en documentDiscountPct y en la diferencia lista→neto).
+- Si **netUnitPrice** es 0 pero **listUnitPrice** > 0: **directUnitCost** = listUnitPrice y **lineDiscountPct** = documentDiscountPct.
+- Si solo hay un precio unitario sin columnas separadas: ponlo en listUnitPrice o netUnitPrice según el encabezado del PDF; directUnitCost igual al precio que corresponda aplicar en pedido; documentDiscountPct y lineDiscountPct coherentes con la fila.
+
+Ejemplo: Precio 265, Desc 40, Neto 159 → listUnitPrice **265**, documentDiscountPct **40**, netUnitPrice **159**, lineAmount según importe línea, directUnitCost **159**, lineDiscountPct **0**.
+
+OBLIGATORIO en numeros JSON: solo **PUNTO** decimal (ej. 37.92). PROHIBIDO la coma en numeros.
+**quantity** con punto si es decimal (ej. 2.0).
+Incluye **siempre** en cada objeto las claves listUnitPrice, netUnitPrice, lineAmount, documentDiscountPct, directUnitCost, lineDiscountPct (usa 0 donde no aplique).
+El array JSON debe estar COMPLETO (no truncar la respuesta)."""
+
+_SYSTEM_RULES_TABLE_ROWS = """Si hay seccion "### LINEAS_DETALLE_ALINEADAS_POR_COORDENADAS" y/o "### TABLAS_PYMUPDF":
+- Prioriza LINEAS_DETALLE (filas codigo | descripcion | cantidad | precio_unitario | importe_linea) como fuente por fila; el texto plano suele tener numeros en orden incorrecto o **repetir** el mismo listado de articulos.
+- Si LINEAS_DETALLE incluye **DETALLE_CANONICO: N filas**, el array JSON debe tener **exactamente N** objetos, en el **mismo orden**, sin filas inventadas ni duplicar el bloque de lineas otra vez.
+- Una descripcion que en el PDF ocupa **varias lineas** es **una sola fila** de detalle: en LINEAS_DETALLE ya suele ir el texto unido; genera **un solo** objeto JSON (no uno por linea de texto del PDF).
+- **listUnitPrice** = precio unitario de la fila si la tabla es precio bruto; si la cabecera indica precio neto, usa **netUnitPrice**. **lineAmount** = importe_linea. **documentDiscountPct** si aparece dto en esa fila o en cabecera clara.
+- Comprueba cantidad * precio unitario ≈ importe_linea (tolerancia redondeo).
+- Para "### TABLAS_PYMUPDF": mismas reglas por fila.
+- Codigo → vendorItemNo; nunca como precio."""
 
 _SYSTEM_RULES_DESCRIPTION_QUALITY = """Calidad de **description**:
 - Copia la descripcion de CADA linea tal como aparece en el PDF para esa linea. Esta PROHIBIDO reutilizar la misma descripcion en todos los objetos si en el documento las descripciones son distintas (LAMPARA, BOMBILLA, CABLE, etc. deben ser textos distintos).
-- Si una descripcion es muy larga, recortala pero sin sustituirla por la de otra linea."""
+- Si una descripcion es muy larga, recortala pero sin sustituirla por la de otra linea.
+- Si LINEAS_DETALLE ya une una descripcion multilinea en una sola fila codigo|descripcion|..., usa ese texto unido en **description** (no partas en dos objetos JSON)."""
 
 _SYSTEM_PROMPT_CORE_NO_HISTORY = (
     """Eres un extractor de datos de presupuestos PDF (obras, suministros, servicios).
 Debes responder ÚNICAMENTE con un array JSON válido, sin texto antes ni después.
 Formato de cada elemento:
-{"description":"texto","quantity":0,"directUnitCost":0,"lineDiscountPct":0,"vendorItemNo":""}
+{"description":"","quantity":0,"vendorItemNo":"","listUnitPrice":0,"netUnitPrice":0,"lineAmount":0,"documentDiscountPct":0,"directUnitCost":0,"lineDiscountPct":0}
 
 """
-    + _SYSTEM_RULES_COST_QTY
+    + _SYSTEM_RULES_EXTENDED_COLUMNS
     + "\n"
     + _SYSTEM_RULES_DESCRIPTION_QUALITY
 )
@@ -88,29 +168,34 @@ _SYSTEM_PROMPT_CORE_WITH_HISTORY = (
     """Eres un extractor de datos de presupuestos PDF (obras, suministros, servicios).
 Debes responder ÚNICAMENTE con un array JSON válido, sin texto antes ni después.
 Formato de cada elemento:
-{"description":"texto","quantity":0,"directUnitCost":0,"lineDiscountPct":0,"vendorItemNo":"","lineType":"","no":""}
+{"description":"","quantity":0,"vendorItemNo":"","listUnitPrice":0,"netUnitPrice":0,"lineAmount":0,"documentDiscountPct":0,"directUnitCost":0,"lineDiscountPct":0,"lineType":"","no":""}
 
-Si hay historico de compras del proveedor: lineType debe ser uno de Item, G_L_Account, Resource, Fixed_Asset, Charge_Item.
-El campo no debe copiar EXACTAMENTE un codigo que exista en el historico (producto o cuenta G/L). Si no hay match claro, lineType y no como "". NO inventes codigos.
+Clasificacion contable (solo si el prompt incluye bloque HISTORICO):
+- **lineType** debe ser exactamente uno de: Item, G_L_Account, Resource, Fixed_Asset, Charge_Item (mismos nombres que en el historico).
+- **vendorItemNo** es el codigo/ref. del proveedor en el PDF (catalogo del proveedor). NO es el numero de producto Item en Business Central salvo que el historico demuestre que ese codigo se usa como Item.
+- **no** es el codigo BC del tipo elegido: numero de producto si lineType=Item, numero de cuenta si lineType=G_L_Account, etc. Debe coincidir **literalmente** con el campo codigo de **alguna** fila del historico del mismo lineType (sin inventar numeros). No uses 1, 2, 3… como **no** salvo que aparezcan como codigo Item en el historico.
+- Si una fila del PDF no encaja con una linea concreta del historico (descripcion/categoria distinta), usa la **moda** del historico: el par (lineType, codigo) mas repetido en las lineas recientes. Si casi todo es G_L_Account con la misma cuenta (ej. 622000010 o 602000003), las nuevas lineas de compra generica deben ir a esa cuenta salvo que una fila del historico sea un match claro de Item.
+- Si el historico esta vacio o es ilegible, deja **lineType** y **no** como cadena vacia "".
 
 """
-    + _SYSTEM_RULES_COST_QTY
+    + _SYSTEM_RULES_EXTENDED_COLUMNS
     + "\n"
     + _SYSTEM_RULES_DESCRIPTION_QUALITY
 )
 
 USER_PROMPT_HISTORY_BLOCK = """
 --- HISTORICO DE COMPRAS RECIENTES (mismo proveedor) ---
-Cada linea tiene formato: tipo|codigo|descripcion|fecha_publicacion
-tipos posibles en el historico: Item, G_L_Account, Resource, Fixed_Asset, Charge_Item
-Para cada linea del presupuesto, elige lineType y no copiando EXACTAMENTE tipo y codigo de una fila del historico cuando encaje; si no encaja, lineType y no vacios.
+Cada linea: tipo|codigo|descripcion|fecha_publicacion
+tipos permitidos en tipo: Item, G_L_Account, Resource, Fixed_Asset, Charge_Item
+Usa este historico para rellenar lineType y no en cada linea del PDF (reglas en el system). El codigo del PDF va solo en vendorItemNo.
 
 {history}
 --- FIN HISTORICO ---
 """
 
-USER_PROMPT_TEMPLATE = """Extrae lineas de compra del siguiente texto del PDF (suele incluir cabeceras de tabla y lineas con codigo, descripcion, cantidades e importes).
-Respeta el orden del documento: codigo de articulo → vendorItemNo; precio unitario/neto → directUnitCost (nunca el codigo como precio).
+USER_PROMPT_TEMPLATE = """Extrae lineas de compra del siguiente texto del PDF (suele incluir cabeceras de tabla y lineas con codigo, descripcion, cantidades, precios, dto, netos e importes).
+Respeta el orden del documento: codigo → vendorItemNo; copia columnas en listUnitPrice, netUnitPrice, lineAmount y documentDiscountPct; directUnitCost/lineDiscountPct coherentes con esas columnas (nunca el codigo como precio).
+Si aparece LINEAS_DETALLE con DETALLE_CANONICO, no dupliques lineas ni re-leas el mismo catalogo dos veces (el texto plano suele repetir filas tras descripciones largas).
 Devuelve SOLO el array JSON de lineas de detalle (excluye subtotales/IVA globales).
 
 --- TEXTO DEL DOCUMENTO ---
@@ -135,6 +220,54 @@ def build_user_prompt(extracted_pdf_text: str, purchase_history_lines: list[str]
     return doc + USER_PROMPT_HISTORY_BLOCK.format(history=history)
 
 
+def log_llm_user_prompt_payload(
+    user_content: str,
+    *,
+    extracted_full_len: int,
+    text_for_llm_len: int,
+    pdf_truncated: bool,
+) -> None:
+    """
+    Registra el mensaje 'user' enviado al LLM (plantilla + texto del PDF + histórico si hay).
+
+    Por defecto DESACTIVADO (evita volcar PDFs en logs).
+
+    UTILESIA_LOG_LLM_USER_PROMPT=1 — activar (también true/yes/on).
+    UTILESIA_LOG_LLM_PROMPT_MAX_CHARS — recorte del log (por defecto 12000); 0 = sin recorte.
+    """
+    if not env_flag_enabled("UTILESIA_LOG_LLM_USER_PROMPT", default=False):
+        return
+
+    raw_max = os.environ.get("UTILESIA_LOG_LLM_PROMPT_MAX_CHARS", "12000").strip()
+    try:
+        max_log_chars = int(raw_max)
+    except ValueError:
+        max_log_chars = 12000
+
+    logger.info(
+        "LLM mensaje usuario: total_chars=%s pdf_extraido_total=%s pdf_en_prompt=%s pdf_truncado_contexto=%s",
+        len(user_content),
+        extracted_full_len,
+        text_for_llm_len,
+        pdf_truncated,
+    )
+
+    if max_log_chars == 0:
+        logger.info("LLM mensaje usuario (completo):\n%s", user_content)
+        return
+
+    if len(user_content) <= max_log_chars:
+        logger.info("LLM mensaje usuario:\n%s", user_content)
+        return
+
+    logger.info(
+        "LLM mensaje usuario (recorte log %s/%s chars):\n%s\n... [fin recorte log; UTILESIA_LOG_LLM_PROMPT_MAX_CHARS=0 para completo]",
+        max_log_chars,
+        len(user_content),
+        user_content[:max_log_chars],
+    )
+
+
 class ProcessJsonBody(BaseModel):
     """Cuerpo JSON para clientes que no envían multipart (p. ej. Business Central)."""
 
@@ -144,7 +277,10 @@ class ProcessJsonBody(BaseModel):
     context_length: int = Field(128000, description="n_ctx del modelo")
     purchase_history_lines: list[str] = Field(
         default_factory=list,
-        description="Lineas de contexto de compras previas, ej. Item|180012|TORNILLOS|2025-03-01",
+        description=(
+            "Compras previas mismo proveedor: tipo|codigo|descripcion|fecha (tipo en ingles BC: "
+            "Item, G_L_Account, …). Ej. G_L_Account|622000010|Compras mercaderías|2025-03-01"
+        ),
     )
 
 
@@ -167,6 +303,122 @@ def _table_to_pipe_rows(table: Any) -> str:
             cells.append(s)
         out.append(" | ".join(cells))
     return "\n".join(out)
+
+
+_SPANISH_DECIMAL_TOKEN_RE = re.compile(r"^\d+,\d+$")
+
+
+def _cluster_pdf_words_into_lines(words: list[Any], y_tol: float = 6.0) -> list[list[Any]]:
+    buckets: dict[int, list[Any]] = {}
+    for w in words:
+        mid_y = (float(w[1]) + float(w[3])) / 2.0
+        key = int(round(mid_y / y_tol))
+        buckets.setdefault(key, []).append(w)
+    return [sorted(buckets[k], key=lambda x: float(x[0])) for k in sorted(buckets.keys())]
+
+
+def _split_vendor_code_and_desc_tokens(left_tokens: list[str]) -> tuple[str, str]:
+    if not left_tokens:
+        return "", ""
+    first = left_tokens[0]
+    if first.isdigit() and len(first) >= 5:
+        return first, " ".join(left_tokens[1:]).strip()
+    return "", " ".join(left_tokens).strip()
+
+
+def _count_layout_detail_rows(layout_blob: str) -> int:
+    """Cuenta filas codigo|descripcion|cantidad|... en el bloque LINEAS_DETALLE (sin cabeceras marcadoras)."""
+    n = 0
+    for raw in layout_blob.splitlines():
+        s = raw.strip()
+        if not s:
+            continue
+        if "codigo | descripcion" in s:
+            continue
+        parts = [p.strip() for p in s.split("|")]
+        if len(parts) >= 5:
+            n += 1
+    return n
+
+
+def _extract_factura_taller_lines_from_words(doc: fitz.Document) -> str:
+    """
+    Facturas taller / albaran donde get_text('text') desordena columnas.
+    Reconstruye filas usando posiciones X/Y de get_text('words').
+    """
+    out_rows: list[str] = []
+    x_split = float(os.environ.get("UTILESIA_LAYOUT_X_SPLIT", "350"))
+
+    for page_idx, page in enumerate(doc):
+        page_text = page.get_text("text")
+        if "Importe" not in page_text or "Cantidad" not in page_text:
+            continue
+
+        words = page.get_text("words")
+        if not words:
+            continue
+
+        lines = _cluster_pdf_words_into_lines(words, y_tol=6.0)
+        seen_header = False
+        desc_carry: list[str] = []
+
+        for line_words in lines:
+            sorted_w = sorted(line_words, key=lambda w: float(w[0]))
+            joined = " ".join(str(w[4]).strip() for w in sorted_w if str(w[4]).strip())
+            if not joined:
+                continue
+
+            # Cabecera tabla (encoding PDF puede romper "Codigo"/"Descripcion")
+            if (
+                "Importe" in joined
+                and "Cantidad" in joined
+                and ("Precio" in joined or "Unit" in joined)
+                and len(joined) < 160
+            ):
+                seen_header = True
+                out_rows.append(
+                    f"(Pagina {page_idx + 1}) codigo | descripcion | cantidad | precio_unitario | importe_linea"
+                )
+                continue
+
+            if not seen_header:
+                continue
+
+            if "OBSERVACIONES" in joined or joined.startswith("PEDIDO"):
+                break
+            if "Mano Obra" in joined and "Recambios" in joined:
+                break
+
+            nums_right: list[str] = []
+            left_tokens: list[str] = []
+            for w in sorted_w:
+                t = str(w[4]).strip()
+                if not t:
+                    continue
+                x = float(w[0])
+                if x >= x_split:
+                    if _SPANISH_DECIMAL_TOKEN_RE.match(t):
+                        nums_right.append(t)
+                else:
+                    left_tokens.append(t)
+
+            if len(nums_right) >= 3:
+                qty, p_unit, imp_ln = nums_right[-3], nums_right[-2], nums_right[-1]
+                code, desc_line = _split_vendor_code_and_desc_tokens(left_tokens)
+                prefix = " ".join(desc_carry).strip()
+                desc_carry = []
+                desc = (prefix + " " + desc_line).strip()
+                out_rows.append(f"{code} | {desc} | {qty} | {p_unit} | {imp_ln}")
+            elif seen_header and left_tokens:
+                frag = " ".join(left_tokens).strip()
+                noise = ("Documento", "Fecha", "Marca", "Modelo", "N.I.F", "Recepcionista", "Cod.Cli")
+                if frag and not any(frag.startswith(p) for p in noise):
+                    desc_carry.append(frag)
+
+    if len(out_rows) <= 1:
+        return ""
+    logger.info("PDF: reconstruidas %s filas por coordenadas (factura taller)", len(out_rows) - 1)
+    return "\n".join(out_rows)
 
 
 def _extract_tables_sections_from_pdf(doc: fitz.Document) -> str:
@@ -194,8 +446,9 @@ def _extract_tables_sections_from_pdf(doc: fitz.Document) -> str:
 
 def extract_text_from_pdf(pdf_bytes: bytes) -> tuple[str, bool]:
     """
-    Texto para el LLM y si se antepondrán tablas detectadas por PyMuPDF.
-    Por defecto SOLO texto plano (mas estable). Tablas: UTILESIA_ENABLE_TABLE_EXTRACTION=1.
+    Texto para el LLM y si hay bloque estructurado suplementario (coordenadas y/o tablas PyMuPDF).
+    Siempre intenta reconstruir lineas por palabras en facturas taller (sin variable env).
+    Tablas find_tables: UTILESIA_ENABLE_TABLE_EXTRACTION=1.
     """
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     try:
@@ -205,23 +458,66 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> tuple[str, bool]:
 
         plain = "\n\n".join(p.strip() for p in plain_parts if p and p.strip()).strip()
 
+        supplements: list[str] = []
+        structured = False
+        layout_detail_row_count = 0
+
+        if os.environ.get("UTILESIA_DISABLE_WORD_LAYOUT", "").strip().lower() not in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        ):
+            layout_lines = _extract_factura_taller_lines_from_words(doc)
+            if layout_lines:
+                layout_detail_row_count = _count_layout_detail_rows(layout_lines)
+                if layout_detail_row_count >= 1:
+                    layout_header = (
+                        "### LINEAS_DETALLE_ALINEADAS_POR_COORDENADAS\n"
+                        f"(DETALLE_CANONICO: {layout_detail_row_count} filas codigo|descripcion|cantidad|precio|importe. "
+                        "El JSON debe tener exactamente ese numero de objetos en el mismo orden. "
+                        "Descripcion multilinea en el PDF: aqui ya fusionada en una fila; "
+                        "prohibido duplicar filas ni volver a importar el listado desde texto plano.)\n\n"
+                    )
+                else:
+                    layout_header = (
+                        "### LINEAS_DETALLE_ALINEADAS_POR_COORDENADAS\n"
+                        "(Reconstruccion por posicion en el PDF; priorizar sobre texto plano para codigo, "
+                        "descripcion, cantidad, precio unitario e importe de linea)\n\n"
+                    )
+                supplements.append(layout_header + layout_lines)
+                structured = True
+
         tables_on = os.environ.get("UTILESIA_ENABLE_TABLE_EXTRACTION", "").strip().lower() in (
             "1",
             "true",
             "yes",
             "on",
         )
-        if not tables_on:
-            return plain, False
+        if tables_on:
+            tables_blob = _extract_tables_sections_from_pdf(doc)
+            if tables_blob:
+                supplements.append("### TABLAS_PYMUPDF\n\n" + tables_blob)
+                structured = True
 
-        tables_blob = _extract_tables_sections_from_pdf(doc)
-        if tables_blob:
+        suppress_plain = env_flag_enabled(
+            "UTILESIA_SUPPRESS_PLAIN_WITH_LAYOUT", default=True
+        ) and (layout_detail_row_count >= 1)
+
+        if supplements:
+            joined = "\n\n".join(supplements)
+            if suppress_plain:
+                logger.info(
+                    "PDF: omitiendo TEXTO_PLANO (UTILESIA_SUPPRESS_PLAIN_WITH_LAYOUT; %s filas LINEAS_DETALLE)",
+                    layout_detail_row_count,
+                )
+                return joined, structured
             return (
-                "### TABLAS (filas con separador | ; contrastar con texto plano si algo cuadra mal)\n\n"
-                + tables_blob
-                + "\n\n### TEXTO PLANO DEL PDF\n\n"
+                joined
+                + "\n\n### TEXTO_PLANO_ORIGINAL_PDF\n\n"
                 + plain
-            ), True
+            ), structured
+
         return plain, False
     finally:
         doc.close()
@@ -354,15 +650,21 @@ async def call_openai_compatible(
     user_content: str,
     timeout_s: float = 600.0,
 ) -> dict[str, Any]:
+    max_out = resolve_llm_max_completion_tokens()
     payload = {
         "model": model_name,
         "temperature": 0,
         "stream": False,
+        "max_tokens": max_out,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content},
         ],
     }
+    logger.info(
+        "LLM request: max_tokens=%s (ajustar UTILESIA_LLM_MAX_TOKENS si trunca JSON)",
+        max_out,
+    )
 
     async with httpx.AsyncClient(timeout=timeout_s) as client:
         r = await client.post(
@@ -403,12 +705,24 @@ def strip_llm_markdown_fence(text: str) -> str:
     return "\n".join(lines).strip()
 
 
+_NUMERIC_JSON_KEYS_COMMA_REPAIR = (
+    "directUnitCost",
+    "quantity",
+    "lineDiscountPct",
+    "line_discount_pct",
+    "listUnitPrice",
+    "netUnitPrice",
+    "lineAmount",
+    "documentDiscountPct",
+)
+
+
 def repair_european_commas_in_numeric_fields(text: str) -> str:
     """
     El LLM suele escribir importes como 3,06; JSON valido exige 3.06.
     Solo toca valores tras claves conocidas para no romper strings.
     """
-    keys = ("directUnitCost", "quantity", "lineDiscountPct", "line_discount_pct")
+    keys = _NUMERIC_JSON_KEYS_COMMA_REPAIR
     out = text
     for key in keys:
         pattern = rf'("{re.escape(key)}"\s*:\s*)(-?\d+),(\d+)'
@@ -420,6 +734,185 @@ def repair_european_commas_in_numeric_fields(text: str) -> str:
     return out
 
 
+def repair_json_trailing_commas(text: str) -> str:
+    """Quita comas finales antes de ] o } (JSON estricto)."""
+    t = text
+    for _ in range(12):
+        nxt = re.sub(r",\s*]", "]", t)
+        nxt = re.sub(r",\s*}", "}", nxt)
+        if nxt == t:
+            break
+        t = nxt
+    return t
+
+
+def salvage_partial_json_array_raw_decode(text: str) -> str | None:
+    """
+    Recupera objetos JSON completos cuando la respuesta se corto a mitad del array
+    (p.ej. vendorItemNo sin cerrar comilla).
+    """
+    s = text.strip()
+    if not s.startswith("["):
+        return None
+    dec = json.JSONDecoder()
+    idx = 1
+    items: list[Any] = []
+    while idx < len(s):
+        while idx < len(s) and s[idx] in " \n\r\t,":
+            idx += 1
+        if idx >= len(s) or s[idx] == "]":
+            break
+        try:
+            obj, end = dec.raw_decode(s, idx)
+        except json.JSONDecodeError:
+            break
+        items.append(obj)
+        idx = end
+    if not items:
+        return None
+    logger.warning(
+        "JSON del LLM incompleto: se devolvieron %s objetos validos (resto truncado)",
+        len(items),
+    )
+    return json.dumps(items, ensure_ascii=False)
+
+
+def salvage_truncated_json_array(text: str) -> str | None:
+    """
+    Si el modelo corto la respuesta a mitad de cadena/objeto, intenta cerrar hasta el ultimo } completo.
+    """
+    base = text.strip()
+    if not base.startswith("["):
+        return None
+    for cut in range(len(base), max(2, len(base) // 4), -1):
+        chunk = base[:cut].rstrip().rstrip(",")
+        while chunk and chunk[-1] not in "}]":
+            chunk = chunk[:-1].rstrip().rstrip(",")
+        if not chunk.endswith("}"):
+            continue
+        open_curly = chunk.count("{") - chunk.count("}")
+        open_sq = chunk.count("[") - chunk.count("]")
+        trial = chunk + ("}" * max(0, open_curly)) + ("]" * max(0, open_sq))
+        trial = repair_json_trailing_commas(trial)
+        try:
+            parsed = json.loads(trial)
+            if isinstance(parsed, list) and parsed:
+                return json.dumps(parsed, ensure_ascii=False)
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
+_NUMERIC_KEYS_CANONICALIZE = frozenset(
+    {
+        "quantity",
+        "directunitcost",
+        "linediscountpct",
+        "line_discount_pct",
+        "listunitprice",
+        "netunitprice",
+        "lineamount",
+        "documentdiscountpct",
+    }
+)
+
+
+def _parse_optional_float(v: Any) -> float | None:
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    if isinstance(v, str):
+        t = v.strip().replace(" ", "")
+        if not t:
+            return None
+        tnorm = t.replace(",", ".") if "," in t and t.count(",") == 1 else t
+        try:
+            return float(tnorm)
+        except ValueError:
+            return None
+    return None
+
+
+def derive_bc_fields_from_extended_columns(data: Any) -> Any:
+    """
+    Ajusta directUnitCost y lineDiscountPct desde columnas extendidas del PDF.
+
+    UTILESIA_DERIVE_BC_FROM_EXTENDED=0 — no modificar (solo lo que devolvió el LLM).
+    Por defecto: si netUnitPrice > 0 → directUnitCost = neto, lineDiscountPct = 0;
+    si no hay neto pero listUnitPrice > 0 → directUnitCost = lista, lineDiscountPct desde documentDiscountPct o lineDiscountPct previo.
+    """
+    off = os.environ.get("UTILESIA_DERIVE_BC_FROM_EXTENDED", "1").strip().lower()
+    if off in ("0", "false", "no", "off"):
+        return data
+    if isinstance(data, list):
+        return [derive_bc_fields_from_extended_columns(x) for x in data]
+    if not isinstance(data, dict):
+        return data
+
+    obj = data
+    net = _parse_optional_float(obj.get("netUnitPrice"))
+    lst = _parse_optional_float(obj.get("listUnitPrice"))
+    doc_explicit = obj.get("documentDiscountPct")
+    has_doc_key = "documentDiscountPct" in obj
+    doc_num = _parse_optional_float(doc_explicit) if has_doc_key else None
+    fallback_dto = _parse_optional_float(obj.get("lineDiscountPct"))
+
+    if net is not None and net > 0:
+        obj["directUnitCost"] = round(net, 5)
+        obj["lineDiscountPct"] = 0
+        if not has_doc_key and fallback_dto is not None:
+            obj["documentDiscountPct"] = round(fallback_dto, 5)
+    elif lst is not None and lst > 0:
+        dto_apply = round(doc_num if doc_num is not None else (fallback_dto or 0), 5)
+        obj["directUnitCost"] = round(lst, 5)
+        obj["lineDiscountPct"] = dto_apply
+        if not has_doc_key and fallback_dto is not None:
+            obj["documentDiscountPct"] = round(fallback_dto, 5)
+
+    return obj
+
+
+def canonicalize_line_items_for_bc(data: Any) -> Any:
+    """Redondea numeros para evitar formatos raros; BC tolera mejor pocas cifras decimales."""
+    if isinstance(data, list):
+        return [canonicalize_line_items_for_bc(x) for x in data]
+    if isinstance(data, dict):
+        out: dict[str, Any] = {}
+        for k, v in data.items():
+            lk = str(k).lower()
+            if lk in _NUMERIC_KEYS_CANONICALIZE:
+                if isinstance(v, bool):
+                    out[k] = v
+                elif v is None:
+                    out[k] = v
+                elif isinstance(v, (int, float)):
+                    if lk == "quantity":
+                        q = float(v)
+                        out[k] = int(q) if abs(q - round(q)) < 1e-9 else round(q, 5)
+                    else:
+                        out[k] = round(float(v), 5)
+                elif isinstance(v, str):
+                    t = v.strip().replace(" ", "")
+                    tnorm = t.replace(",", ".") if "," in t and t.count(",") == 1 else t
+                    try:
+                        fv = float(tnorm)
+                        if lk == "quantity":
+                            out[k] = int(fv) if abs(fv - round(fv)) < 1e-9 else round(fv, 5)
+                        else:
+                            out[k] = round(fv, 5)
+                    except ValueError:
+                        out[k] = v
+                else:
+                    out[k] = v
+            else:
+                out[k] = v
+        return out
+    return data
+
+
 def normalize_assistant_json_text(raw: str) -> tuple[str, bool, bool]:
     """
     Devuelve (texto_para_cliente, json_parseable, se_aplico_reparacion).
@@ -428,11 +921,26 @@ def normalize_assistant_json_text(raw: str) -> tuple[str, bool, bool]:
     raw_stripped = raw.strip()
     stripped = strip_llm_markdown_fence(raw)
     repaired = repair_european_commas_in_numeric_fields(stripped)
+    repaired = repair_json_trailing_commas(repaired)
     repaired_flag = raw_stripped != stripped or stripped != repaired
 
-    for candidate in (repaired, stripped, raw_stripped):
+    candidates: list[str] = [repaired, stripped, raw_stripped]
+    partial_ok = salvage_partial_json_array_raw_decode(repaired)
+    if partial_ok:
+        candidates.insert(0, partial_ok)
+        repaired_flag = True
+    salvaged = salvage_truncated_json_array(repaired)
+    if salvaged:
+        candidates.insert(0, salvaged)
+        repaired_flag = True
+
+    for candidate in candidates:
+        if not candidate.strip():
+            continue
         try:
             parsed = json.loads(candidate)
+            parsed = canonicalize_line_items_for_bc(parsed)
+            parsed = derive_bc_fields_from_extended_columns(parsed)
             canon = json.dumps(parsed, ensure_ascii=False)
             return canon, True, repaired_flag
         except json.JSONDecodeError:
@@ -519,6 +1027,13 @@ async def run_pipeline(
     system_prompt = build_system_prompt(has_history, pdf_table_sections_in_prompt)
     user_content = build_user_prompt(text_for_llm, hist_lines)
 
+    log_llm_user_prompt_payload(
+        user_content,
+        extracted_full_len=len(extracted),
+        text_for_llm_len=len(text_for_llm),
+        pdf_truncated=was_truncated,
+    )
+
     try:
         raw = await call_openai_compatible(api_url, model_name, system_prompt, user_content)
     except HTTPException:
@@ -556,6 +1071,20 @@ async def run_pipeline(
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "UtilesIA", "build": APP_BUILD}
+
+
+@app.get("/settings")
+async def settings():
+    """Configuración efectiva (sin secretos). utilesia.env se documenta en utilesia.env.example."""
+    return {
+        "build": APP_BUILD,
+        "env_file_loaded": _UTILESIA_ENV_SOURCE,
+        "log_llm_user_prompt": env_flag_enabled("UTILESIA_LOG_LLM_USER_PROMPT", default=False),
+        "log_llm_prompt_max_chars": os.environ.get("UTILESIA_LOG_LLM_PROMPT_MAX_CHARS", "12000"),
+        "suppress_plain_pdf_with_layout": env_flag_enabled(
+            "UTILESIA_SUPPRESS_PLAIN_WITH_LAYOUT", default=True
+        ),
+    }
 
 
 @app.get("/version")
